@@ -2,8 +2,8 @@
 
 # Resume Robot API Server Setup Script
 # Version: 3.0.0
-# Purpose: Complete automated setup of Resume Robot API server on Ubuntu 22.04 LTS
-# Requirements: Fresh Ubuntu 22.04 LTS server (2GB RAM, 2 vCPU, 60GB SSD minimum)
+# Purpose: Complete automated setup of Resume Robot API server on Ubuntu 22.04 LTS with remote PostgreSQL database
+# Requirements: Fresh Ubuntu 22.04 LTS server (2GB RAM, 2 vCPU, 60GB SSD minimum) + Remote PostgreSQL server
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
@@ -17,6 +17,10 @@ SETUP_DIR="/opt/resume-robot"
 APP_USER="resumerobot"
 APP_DIR="/home/$APP_USER/api"
 DOMAIN=""  # Will be prompted
+DB_HOST=""  # Will be prompted
+DB_PORT="5432"  # Will be prompted
+DB_SUPERUSER=""  # Will be prompted
+DB_SUPERUSER_PASSWORD=""  # Will be prompted
 DB_NAME="resumerobot_db"
 DB_USER="resumerobot_user"
 DB_PASSWORD=""  # Will be generated
@@ -118,17 +122,13 @@ install_nodejs() {
     log "Node.js installed: $node_version, npm: $npm_version"
 }
 
-install_postgresql() {
-    log "Installing PostgreSQL 14..."
-    apt install -y postgresql postgresql-contrib postgresql-client-14
-    
-    # Start and enable PostgreSQL
-    systemctl start postgresql
-    systemctl enable postgresql
+install_postgresql_client() {
+    log "Installing PostgreSQL client tools..."
+    apt install -y postgresql-client-14
     
     # Verify installation
-    pg_version=$(sudo -u postgres psql -c "SELECT version();" | head -n 3 | tail -n 1)
-    log "PostgreSQL installed: $pg_version"
+    psql_version=$(psql --version)
+    log "PostgreSQL client installed: $psql_version"
 }
 
 install_nginx() {
@@ -204,36 +204,73 @@ setup_directories() {
 # =============================================================================
 
 setup_database() {
-    log "Setting up PostgreSQL database..."
+    log "Setting up remote PostgreSQL database..."
     
     # Generate database password if not set
     if [[ -z "$DB_PASSWORD" ]]; then
         DB_PASSWORD=$(generate_password)
     fi
     
-    # Create database and user
-    sudo -u postgres psql << EOF
-CREATE DATABASE $DB_NAME;
-CREATE USER $DB_USER WITH ENCRYPTED PASSWORD '$DB_PASSWORD';
+    # Test connection to remote database server
+    log "Testing connection to remote database server..."
+    if ! PGPASSWORD="$DB_SUPERUSER_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_SUPERUSER" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+        error "Cannot connect to remote database server at $DB_HOST:$DB_PORT with provided credentials"
+    fi
+    
+    log "Connection to remote database server successful"
+    
+    # Create database and user on remote server
+    log "Creating database and user on remote server..."
+    PGPASSWORD="$DB_SUPERUSER_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_SUPERUSER" -d postgres << EOF
+-- Create database if it doesn't exist
+SELECT 'CREATE DATABASE $DB_NAME' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$DB_NAME')\gexec
+
+-- Create user if it doesn't exist
+DO \$\$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$DB_USER') THEN
+      CREATE USER $DB_USER WITH ENCRYPTED PASSWORD '$DB_PASSWORD';
+   ELSE
+      ALTER USER $DB_USER WITH ENCRYPTED PASSWORD '$DB_PASSWORD';
+   END IF;
+END
+\$\$;
+
+-- Grant privileges
 GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;
 ALTER USER $DB_USER CREATEDB;
+
+-- Connect to the new database and grant schema privileges
+\c $DB_NAME;
+GRANT ALL PRIVILEGES ON SCHEMA public TO $DB_USER;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $DB_USER;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $DB_USER;
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO $DB_USER;
+
+-- Set default privileges for future objects
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO $DB_USER;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO $DB_USER;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON FUNCTIONS TO $DB_USER;
+
 \q
 EOF
     
-    # Test connection
-    if PGPASSWORD="$DB_PASSWORD" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" >/dev/null 2>&1; then
-        log "Database connection test successful"
+    # Test connection with new user
+    if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" >/dev/null 2>&1; then
+        log "Database user connection test successful"
     else
-        error "Database connection test failed"
+        error "Database user connection test failed"
     fi
     
     # Save database credentials securely
     cat > "$SETUP_DIR/db_credentials.txt" << EOF
+Database Host: $DB_HOST
+Database Port: $DB_PORT
 Database Name: $DB_NAME
 Database User: $DB_USER
 Database Password: $DB_PASSWORD
-Database Host: localhost
-Database Port: 5432
+Database Superuser: $DB_SUPERUSER
+Connection String: postgresql://$DB_USER:$DB_PASSWORD@$DB_HOST:$DB_PORT/$DB_NAME
 EOF
     
     chmod 600 "$SETUP_DIR/db_credentials.txt"
@@ -293,8 +330,8 @@ NODE_ENV=production
 PORT=3000
 
 # Database Configuration
-DB_HOST=localhost
-DB_PORT=5432
+DB_HOST=$DB_HOST
+DB_PORT=$DB_PORT
 DB_NAME=$DB_NAME
 DB_USER=$DB_USER
 DB_PASSWORD=$DB_PASSWORD
@@ -531,8 +568,7 @@ configure_firewall() {
     # Allow HTTP and HTTPS
     ufw allow 'Nginx Full'
     
-    # Allow PostgreSQL (only from localhost)
-    ufw allow from 127.0.0.1 to any port 5432
+    # Note: PostgreSQL is on remote server, no local firewall rules needed
     
     # Enable firewall
     ufw --force enable
@@ -608,8 +644,11 @@ setup_backups() {
 # Resume Robot Automated Backup Script
 
 BACKUP_DIR="/var/lib/resume-robot/backups"
+DB_HOST="$DB_HOST"
+DB_PORT="$DB_PORT"
 DB_NAME="$DB_NAME"
 DB_USER="$DB_USER"
+DB_PASSWORD="$DB_PASSWORD"
 APP_DIR="$APP_DIR"
 RETENTION_DAYS=30
 
@@ -617,18 +656,18 @@ RETENTION_DAYS=30
 TIMESTAMP=\$(date +%Y%m%d_%H%M%S)
 
 # Database backup
-log "Creating database backup..."
-PGPASSWORD="$DB_PASSWORD" pg_dump -h localhost -U \$DB_USER \$DB_NAME > "\$BACKUP_DIR/db_backup_\$TIMESTAMP.sql"
+echo "Creating database backup..."
+PGPASSWORD="\$DB_PASSWORD" pg_dump -h "\$DB_HOST" -p "\$DB_PORT" -U "\$DB_USER" "\$DB_NAME" > "\$BACKUP_DIR/db_backup_\$TIMESTAMP.sql"
 
 # Application files backup
-log "Creating application backup..."
+echo "Creating application backup..."
 tar -czf "\$BACKUP_DIR/app_backup_\$TIMESTAMP.tar.gz" -C "\$(dirname \$APP_DIR)" "\$(basename \$APP_DIR)" --exclude="node_modules" --exclude=".git"
 
 # Cleanup old backups
 find "\$BACKUP_DIR" -name "*.sql" -mtime +\$RETENTION_DAYS -delete
 find "\$BACKUP_DIR" -name "*.tar.gz" -mtime +\$RETENTION_DAYS -delete
 
-log "Backup completed: \$TIMESTAMP"
+echo "Backup completed: \$TIMESTAMP"
 EOF
     
     chmod +x "$SETUP_DIR/backup.sh"
@@ -711,8 +750,12 @@ echo "=== Resume Robot API Status ==="
 echo "Application Status:"
 sudo -u $APP_USER pm2 status resume-robot-api
 echo ""
-echo "Database Status:"
-systemctl status postgresql --no-pager -l
+echo "Database Connection:"
+if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT 'Database: Connected' as status;" 2>/dev/null; then
+    echo "✅ Database connection successful"
+else
+    echo "❌ Database connection failed"
+fi
 echo ""
 echo "Nginx Status:"
 systemctl status nginx --no-pager -l
@@ -764,16 +807,23 @@ Domain: $DOMAIN
 === Installed Components ===
 - Ubuntu $(lsb_release -rs)
 - Node.js $(node --version)
-- PostgreSQL $(sudo -u postgres psql -c "SELECT version();" | head -n 3 | tail -n 1 | cut -d' ' -f2)
+- PostgreSQL Client $(psql --version | cut -d' ' -f3)
 - Nginx $(nginx -v 2>&1 | cut -d' ' -f3)
 - PM2 $(pm2 --version)
 - Certbot $(certbot --version | cut -d' ' -f2)
 
-=== Database Information ===
+=== Remote Database ===
+Database Server: $DB_HOST:$DB_PORT
 Database Name: $DB_NAME
 Database User: $DB_USER
-Database Host: localhost
-Database Port: 5432
+Connection Status: $(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT 'Connected'" 2>/dev/null | grep Connected || echo "Connection Test Failed")
+
+=== Database Information ===
+Database Host: $DB_HOST
+Database Port: $DB_PORT
+Database Name: $DB_NAME
+Database User: $DB_USER
+Connection: postgresql://$DB_USER:***@$DB_HOST:$DB_PORT/$DB_NAME
 
 === Application Information ===
 Application User: $APP_USER
@@ -841,10 +891,19 @@ main() {
     info "Please provide the following information:"
     prompt_for_input "Enter your domain name (e.g., api.resumerobot.com)" "DOMAIN"
     
+    echo -e "\n${BLUE}Database Server Configuration:${NC}"
+    prompt_for_input "Enter database server IP address" "DB_HOST"
+    prompt_for_input "Enter database server port" "DB_PORT" "5432"
+    prompt_for_input "Enter database superuser username" "DB_SUPERUSER" "postgres"
+    prompt_for_input "Enter database superuser password" "DB_SUPERUSER_PASSWORD" "" "true"
+    
     # Confirm installation
     echo -e "\n${YELLOW}Installation Summary:${NC}"
     echo "Domain: $DOMAIN"
-    echo "Database: $DB_NAME"
+    echo "Database Host: $DB_HOST:$DB_PORT"
+    echo "Database Superuser: $DB_SUPERUSER"
+    echo "New Database: $DB_NAME"
+    echo "New Database User: $DB_USER"
     echo "App User: $APP_USER"
     echo "Installation Directory: $APP_DIR"
     echo ""
@@ -861,7 +920,7 @@ main() {
     
     update_system
     install_nodejs
-    install_postgresql
+    install_postgresql_client
     install_nginx
     install_pm2
     install_certbot
@@ -892,6 +951,7 @@ main() {
         log "✅ Resume Robot API Server installation completed successfully!"
         log "🌐 Your API is now running at: https://$DOMAIN/api/"
         log "📊 Health check: https://$DOMAIN/health"
+        log "🗄️ Remote database: $DB_HOST:$DB_PORT"
         log "📋 Installation summary: $SETUP_DIR/installation_summary.txt"
         log "🔧 Admin scripts available in: $SETUP_DIR/"
         
@@ -899,7 +959,8 @@ main() {
         echo "1. Configure OpenAI API key in $APP_DIR/.env"
         echo "2. Configure email settings in $APP_DIR/.env"
         echo "3. Test API endpoints"
-        echo "4. Set up external backup storage"
+        echo "4. Verify remote database connectivity"
+        echo "5. Set up external backup storage"
         echo ""
         echo -e "${BLUE}Quick Commands:${NC}"
         echo "Check status: $SETUP_DIR/status.sh"
