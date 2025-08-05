@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Resume Robot API Server Setup Script
-# Version: 3.0.0
+# Version: 3.0.0 v15
 # Purpose: Complete automated setup of Resume Robot API server on Ubuntu 22.04 LTS with remote PostgreSQL database
 # Requirements: Fresh Ubuntu 22.04 LTS server (2GB RAM, 2 vCPU, 60GB SSD minimum) + Remote PostgreSQL server
 
