@@ -124,7 +124,7 @@ install_nodejs() {
 
 install_postgresql_client() {
     log "Installing PostgreSQL client tools..."
-    apt install -y postgresql-client-14
+    apt install -y postgresql-client
     
     # Verify installation
     psql_version=$(psql --version)
